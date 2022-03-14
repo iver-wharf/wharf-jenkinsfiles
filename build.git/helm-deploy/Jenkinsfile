@@ -1,0 +1,99 @@
+properties([
+  parameters([
+    // Default parameters
+    string(name: 'BUILD_NAME', defaultValue: '', description: 'Used for the display name of the Jenkins build', ),
+    string(name: 'BUILD_REF', defaultValue: '', description: 'Build reference (for third party software)'),
+    string(name: 'GIT_CLONE_BRANCH', defaultValue: 'master', description: 'The branch to build', ),
+    string(name: 'GIT_CLONE_URL', defaultValue: '', description: 'Full URL of the git repo (ex: git@github.com/foo/bar.git)', ),
+    string(name: 'GIT_CREDENTIALS_ID', defaultValue: '', description: 'Git credentials id', ),
+    string(name: 'WHARF_PROJECT_ID', defaultValue: '', description: 'Number in Wharf DB that identifies a project'),
+    string(name: 'WHARF_INSTANCE', defaultValue: '', description: 'Identifies Wharf instance that started the build (e.g. stage)'),
+    // helm-deploy specific parameters
+    string(name: 'CHART_NAME', defaultValue: '', description: 'Name of chart to deploy'),
+    string(name: 'CHART_REPO', defaultValue: 'stable', description: 'Chart repository URL. If set to "stable" it will use kubernetes-charts.storage.googleapis.com.'),
+    string(name: 'CHART_VERSION', defaultValue: '', description: 'Chart version. Will use latest if left blank.'),
+    string(name: 'CONFIGMAP_NAME', defaultValue: 'kubectl-config', description: 'Config map name'),
+    string(name: 'HELM_ARGUMENTS', defaultValue: '', description: 'Additional Helm arguments.'),
+    text(name: 'HELM_RESOURCE', defaultValue: '', description: 'Resource as YAML-text', ),
+    string(name: 'HELM_VERSION', defaultValue: 'v2.14.1', description: 'Helm version (v2.14.1/v3.0.2)'),
+    string(name: 'NAMESPACE', defaultValue: '', description: 'Kubernetes namespace'),
+    password(name: 'REG_PASS', defaultValue: '', description: 'Registry password'),
+    string(name: 'REG_USER', defaultValue: '', description: 'Registry user'),
+    string(name: 'RELEASE_NAME', defaultValue: '', description: 'Helm release name'),
+  ])
+])
+
+def label = "helm-${UUID.randomUUID().toString()}"
+
+podTemplate(name: 'helm', label: label, yaml: """
+kind: Pod
+metadata:
+  name: helm-deploy
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+  - name: helm-deploy
+    image:  wharfse/helm:${params.HELM_VERSION}
+    imagePullPolicy: IfNotPresent
+    command:
+    - /bin/sh
+    tty: true
+    volumeMounts:
+      - name: kubectl-config-volume
+        mountPath: /root/.kube
+  volumes:
+    - name: kubectl-config-volume
+      configMap:
+        name: ${params.CONFIGMAP_NAME}
+  imagePullSecrets:
+  - name: gitlab-registry
+"""
+  ) {
+  logstash {
+    node(label) {
+      currentBuild.displayName = "${params.BUILD_NAME} ${params.CHART_NAME}"
+
+      def login = ""
+      if(params.REG_USER != "") {
+        login = "--username '${params.REG_USER}' --password '${params.REG_PASS}'"
+      }
+
+      def repo = "--repo https://kubernetes-charts.storage.googleapis.com"
+      if(params.CHART_REPO != "stable") {
+        repo = "--repo ${params.CHART_REPO}"
+      }
+
+      def version = ""
+      if(params.CHART_VERSION != '') {
+        version = "--version ${params.CHART_VERSION}"
+      }
+
+      def resource = params.HELM_RESOURCE.replace("`", "'")
+
+      stage("Deploy helm-chart") {
+        if(params.CHART_NAME != '') {
+          container(name: 'helm-deploy', shell: '/bin/bash') {
+            sh """#!/bin/bash
+
+echo "Writing resource to file"
+
+IFS='' read -r -d '' String <<"EOF"
+${resource}
+EOF
+
+echo "\${String}" > values.yml
+
+cat values.yml
+
+echo "Running helm upgrade"
+
+echo helm upgrade ${params.RELEASE_NAME} ${params.CHART_NAME} --install ${version} ${repo}  --namespace ${params.NAMESPACE} -f values.yml --user xxx --pass xxx ${params.HELM_ARGUMENTS}
+helm upgrade ${params.RELEASE_NAME} ${params.CHART_NAME} --install ${version} ${repo} --namespace ${params.NAMESPACE} -f values.yml ${login} ${params.HELM_ARGUMENTS}
+            """
+          }
+        }
+      }
+    }
+  }
+}

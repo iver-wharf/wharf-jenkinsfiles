@@ -1,0 +1,681 @@
+properties([
+  parameters([
+    string(name: 'REPO_NAME', defaultValue: '', description: 'The name to the git repository in gitlab.local', ),
+    string(name: 'REPO_GROUP', defaultValue: 'default', description: 'The group the project is located in.', ),
+    string(name: 'REPO_BRANCH', defaultValue: 'master', description: 'The branch to build.', ),
+    string(name: 'REG_URL', defaultValue: '${BUILTIN_REG_URL}', description: 'Docker registry URL.', ),
+    string(name: 'GIT_URL', defaultValue: '${BUILTIN_GIT_URL}', description: 'Base url to git host', ),
+    string(name: 'GIT_FULLURL', defaultValue: '', description: 'Full url to repo, should replace REPO_NAME, REPO_GROUP etc...', ),
+    string(name: 'GIT_USER', defaultValue: 'git', description: 'User to clone repo as', ),
+    string(name: 'CHART_REPO', defaultValue: '${BUILTIN_CHART_REPO}', description: 'Custom chart repo', ),
+    string(name: 'GIT_CREDENTIALS_ID', defaultValue: '', description: 'Credentials for git', ),
+    string(name: 'RUN_STAGES', defaultValue: 'ALL', description: 'Which stages to run (Use ALL for all stages)'),
+    string(name: 'ENVIRONMENT', defaultValue: '', description: 'Which environment to use'),
+    string(name: 'BUILD_REF', defaultValue: '', description: 'Build reference (for third party software)'),
+    string(name: 'REG_USER', defaultValue: '${BUILTIN_REG_USER}', description: 'chart repo username'),
+    string(name: 'REG_PASS', defaultValue: '${BUILTIN_REG_PASS}', description: 'chart repo password'),
+    string(name: 'WHARF_PROJECT_ID', defaultValue: '', description: 'Number in Wharf DB that identifies a project', ),
+    string(name: 'WHARF_INSTANCE', defaultValue: '', description: 'Identifies Wharf instance that started the build (e.g. stage)'),
+    text(name: 'VARS', defaultValue: '', description: 'Input variables as YAML-text', ),
+    booleanParam(name: 'REG_INSECURE', defaultValue: false, description: 'Insecure registry'),
+    booleanParam(name: 'STRICT_VARIABLE_MODE', defaultValue: false, description: 'Will throw exception and cancel the build from variable errors if enabled.'),
+  ])
+])
+
+def label = "trigger-${UUID.randomUUID().toString()}"
+
+envVars = [:]
+inputVars = [:]
+_replaceVariablesContextLabel = "<unknown>"
+
+def combineContextLabels(String a, String b) {
+  if (a == null) {
+    return b;
+  }
+  else if (b == null) {
+    return a;
+  }
+  else {
+    return "${a}, ${b}"
+  }
+}
+
+def replaceSingleMatch(String match, int lineNumber, List errors) {
+    if (match[-1] != '}') {
+        errors.add("line ${lineNumber}: line contains opening substitution clause '\${' but no ending clause '}'")
+        return match
+    }
+
+    // Turns '${abc}' -> 'abc'
+    def withoutBraces = match[2..-2]
+
+    // A way to escape the variable substitution in case you need
+    // some other tool to do the variable substitution later (like bash)
+    // a match on ${%} gives '${}'
+    // a match on ${%foo%} gives '${foo}'
+    // a match on ${%foo} will try find a variable named '%foo' (and probably fail)
+    if (withoutBraces.length() > 0 && withoutBraces[0] == '%' && withoutBraces[-1] == '%') {
+        if (withoutBraces.length() <= 2) {
+            return '${}'
+        } else {
+            return "\${${withoutBraces[1..-2]}}"
+        }
+    }
+
+    def trimmedMatch = withoutBraces.trim()
+
+    if (trimmedMatch.length() == 0) {
+        errors.add("line ${lineNumber}: variable name cannot be empty in ${match}")
+        return match
+    }
+
+    if (inputVars != null && inputVars[trimmedMatch] != null) {
+        return inputVars[trimmedMatch].toString()
+    }
+
+    if (envVars != null && envVars[trimmedMatch] != null) {
+        return envVars[trimmedMatch].toString()
+    }
+
+    switch (trimmedMatch) {
+        case 'GIT_COMMIT': return env.GIT_COMMIT
+        case 'GIT_COMMIT_SUBJECT': return env.GIT_COMMIT_SUBJECT
+        case 'GIT_COMMIT_AUTHOR_DATE': return env.GIT_COMMIT_AUTHOR_DATE
+        case 'GIT_COMMIT_COMMITTER_DATE': return env.GIT_COMMIT_COMMITTER_DATE
+        case 'GIT_TAG': return env.GIT_TAG
+        case 'GIT_BRANCH': return params.REPO_BRANCH
+        case 'GIT_SAFEBRANCH': return params.REPO_BRANCH.replace("/", "-")
+        case 'REG_URL': return params.REG_URL
+        case 'CHART_REPO': return params.CHART_REPO
+        case 'REPO_NAME': return params.REPO_NAME
+        case 'REPO_GROUP': return params.REPO_GROUP
+        case 'REPO_BRANCH': return params.REPO_BRANCH
+        case 'DEFAULT_DOMAIN': return env.DEFAULT_DOMAIN
+        case 'BUILD_REF': return params.BUILD_REF
+        case 'WHARF_PROJECT_ID': return params.WHARF_PROJECT_ID
+        case 'WHARF_INSTANCE': return params.WHARF_INSTANCE
+
+        default:
+            errors.add("line ${lineNumber}: unknown variable name '${trimmedMatch}' in substitution ${match}")
+            return match
+    }
+}
+
+def replaceVariables(input, String extraContextLabel = null) {
+    if (input == null) {
+        return null
+    }
+
+    def errors = []
+    def lines = input.toString().split('\n')
+    def resultingLines = []
+
+    lines.eachWithIndex { line, index ->
+        def lineNumber = index + 1
+        def result = line.replaceAll(/\$\{%.*?%\}|\$\{[^}]*\}?/, { match ->
+            return replaceSingleMatch(match, lineNumber, errors)
+        })
+
+        resultingLines.add(result)
+    }
+
+    if (errors.size() > 0) {
+        def contextLabel = combineContextLabels(_replaceVariablesContextLabel, extraContextLabel)
+
+        errors.add(0, "\n[!] Failed to replace values in ${contextLabel}:")
+
+        if (params.STRICT_VARIABLE_MODE) {
+          error errors.join('\nerror: ')
+        } else {
+          echo errors.join('\nwarning: ')
+        }
+    }
+
+    return resultingLines.join('\n')
+}
+
+def replaceVariablesInMap(hashMap, String extraContextLabel = null) {
+  if (hashMap instanceof LinkedHashMap) {
+    // create new local map as replaceVariables uses the global inputVars
+    def newMap = [:]
+    for (e in hashMap.entrySet().toArray()) {
+      def contextLabel = combineContextLabels(extraContextLabel, "key:${e.getKey()}")
+      newMap[e.getKey()] = replaceVariables(e.getValue(), contextLabel)
+    }
+    return newMap
+  } else {
+    def contextLabel = combineContextLabels(_replaceVariablesContextLabel, extraContextLabel)
+
+    def message = "[!] Failed to replace variables in ${contextLabel}" +
+      "\nerror: expected ${LinkedHashMap}, got ${hashMap?.getClass()}"
+
+    if (params.STRICT_VARIABLE_MODE) {
+      error message
+    } else {
+      echo message
+    }
+  }
+}
+
+@NonCPS
+def setDomainVariable() {
+  env.DEFAULT_DOMAIN = env.JENKINS_URL.substring(env.JENKINS_URL.indexOf('.')+1, env.JENKINS_URL.length()-1)
+
+  echo env.DEFAULT_DOMAIN
+}
+
+@NonCPS
+def getBuildName() {
+  def buildName = params.REPO_NAME
+  // append (stage) or (*)
+  if (params.RUN_STAGES.toLowerCase() != 'all') {
+    buildName += " (${params.RUN_STAGES})"
+  } else {
+    buildName += " (*)"
+  }
+  // append [environment]
+  if (params.ENVIRONMENT) {
+    buildName += " [${params.ENVIRONMENT}]"
+  }
+  // append #build-ref
+  if (params.BUILD_REF) {
+    buildName += " #${BUILD_REF}"
+  }
+  return buildName
+}
+
+@NonCPS
+def getDisplayName() {
+  def buildName = getBuildName()
+  def displayName = "${params.REPO_GROUP}/${buildName}"
+  return displayName
+}
+
+def runStage(stage, stageName, defaultParams) {
+  def jobs = [:]
+  for(j in stage.entrySet().toArray()) {
+    def jobName =  j.getKey()
+    if(jobName.toLowerCase() == "environments") {
+      continue;
+    }
+
+    _replaceVariablesContextLabel = "stage:${stageName}, step:${jobName}"
+    def values = j.getValue()
+
+    if(values.docker != null) {
+      jobs["Build ${jobName}"] = {
+        def tag = replaceVariables(values.docker.tag, "value:docker.tag");
+
+        if(jobName == params.REPO_NAME.toLowerCase()) {
+          jobName = ""
+        }
+
+        def push = true
+        if(values.docker.push != null) {
+          push = replaceVariables(values.docker.push.toString(), "value:docker.push").toBoolean()
+        }
+
+        def context = ""
+        if(values.docker.context != null) {
+          context = replaceVariables(values.docker.context, "value:docker.context")
+        }
+
+        def secret = "gitlab-registry"
+        if(values.docker.secret != null) {
+          secret = replaceVariables(values.docker.secret, "value:docker.secret")
+        }
+
+        def args = ""
+        if(values.docker.args != null) {
+          args = replaceVariables(values.docker.args.join("\n"), "value:docker.args")
+        }
+
+        def backend = "kaniko"
+        if(values.docker.backend != null) {
+            backend = replaceVariables(values.docker.backend, "value:docker.backend")
+        }
+
+        def name = jobName
+        if(values.docker.name != null) {
+            name = replaceVariables(values.docker.name, "value:docker.name")
+        }
+
+        def registry = params.REG_URL
+        if(values.docker.registry != null) {
+          registry = replaceVariables(values.docker.registry, "value:docker.registry")
+        }
+
+        def group = params.REPO_GROUP
+        if(values.docker.group != null) {
+          group = replaceVariables(values.docker.group, "value:docker.group")
+        }
+
+        def destination = "${registry}/${group}/${params.REPO_NAME}".toLowerCase()
+        if(values.docker.destination != null) {
+          destination = replaceVariables(values.docker.destination, "values:docker.destination").toLowerCase()
+        } else if(name != "" && name != params.REPO_NAME) {
+          destination = destination + "/${name}".toLowerCase()
+        }
+
+        def appendCert = params.REPO_GROUP.toLowerCase().startsWith("default")
+        if (values.docker["append-cert"]) {
+          appendCert = replaceVariables(values.docker["append-cert"].toString(), "value:docker.append-cert").toBoolean()
+        }
+
+        build job: "default-build/${backend}", parameters: defaultParams + [
+          [$class: 'StringParameterValue', name: 'DOCKERFILE_ARGS', value: args],
+          [$class: 'BooleanParameterValue', name: 'DOCKERFILE_APPEND_CERT', value: appendCert],
+          [$class: 'StringParameterValue', name: 'DOCKERFILE_CONTEXT', value: context],
+          [$class: 'StringParameterValue', name: 'DOCKERFILE_PATH', value: replaceVariables(values.docker.file, "value:docker.file")],
+          [$class: 'StringParameterValue', name: 'IMAGE_DESTINATION', value: destination],
+          [$class: 'StringParameterValue', name: 'IMAGE_TAGS', value: tag],
+          [$class: 'BooleanParameterValue', name: 'IMAGE_PUSH', value: push],
+          [$class: 'BooleanParameterValue', name: 'INSECURE', value: params.REG_INSECURE],
+          [$class: 'StringParameterValue', name: 'REG_SECRET', value: secret],
+          [$class: 'StringParameterValue', name: 'ROOT_CERT', value: env.ROOT_CERT],
+        ]
+
+        echo "Done with step docker:${jobName}"
+      }
+    }
+
+    if(values["helm-package"] != null) {
+      jobs["Package ${jobName}"] = {
+        def path = replaceVariables(values["helm-package"]["chart-path"], "value:helm-package.chart-path")
+        def version = replaceVariables(values["helm-package"].version, "value:helm-package.version")
+
+        def destination = "${params.CHART_REPO}/${params.REPO_GROUP}"
+        if(values["helm-package"].destination != null) {
+          destination = replaceVariables(values["helm-package"].destination, "value:helm-package.destination")
+        }
+
+        build job: 'default-build/helm-package', parameters: defaultParams + [
+          [$class: 'StringParameterValue', name: 'CHART_REPO', value: destination],
+          [$class: 'StringParameterValue', name: 'CHART_PATH', value: path],
+          [$class: 'StringParameterValue', name: 'CHART_VERSION', value: version],
+          [$class: 'StringParameterValue', name: 'REG_USER', value: params.REG_USER],
+          [$class: 'StringParameterValue', name: 'REG_PASS', value: params.REG_PASS],
+        ]
+
+        echo "Done with step helm-package:${jobName}"
+      }
+    }
+
+    if(values.helm != null) {
+      jobs["Deploy ${jobName}"] = {
+        def file_contents = []
+        values.helm.files.eachWithIndex { f, index ->
+          f = replaceVariables(f, "value:helm.files[${index}]")
+          file_contents.push(replaceVariables(readFile(f), "value:helm.files[${index}], file:${f}"))
+        }
+        def all_content = file_contents.reverse().join("\n---\n")
+
+        def args = ""
+        if(values.helm.set != null) {
+          def sets = []
+          for(s in values.helm.set) {
+            def key = s.getKey()
+            def val = s.getValue()
+            if(val instanceof String) {
+              val = replaceVariables(val, "value:helm.set.${key}")
+            }
+
+            def esc = val.replaceAll(/'/, "'\\\\''")
+            sets.push("--set '${key}=${val}'")
+          }
+          args = sets.join(" ")
+        }
+
+        def repo = params.CHART_REPO + "/" + params.REPO_GROUP
+        if(values.helm.repo != null) {
+          repo = replaceVariables(values.helm.repo, "value:helm.repo")
+        }
+
+        def chartVersion = ""
+        if(values.helm.chartVersion != null) {
+          chartVersion = replaceVariables(values.helm.chartVersion, "value:helm.chartVersion")
+        }
+
+        def config = "kubectl-config"
+        if(values.helm.cluster != null) {
+          config = replaceVariables(values.helm.cluster, "value:helm.cluster")
+        }
+
+        def username = ""
+        def password = ""
+        echo "${repo} : ${params.CHART_REPO}"
+        if(repo.startsWith(params.CHART_REPO)) {
+          username = params.REG_USER
+          password = params.REG_PASS
+        }
+
+        def helmVersion = "v2.14.1"
+        if(values.helm.helmVersion != null) {
+            helmVersion = replaceVariables(values.helm.helmVersion, "value:helm.helmVersion")
+        }
+
+        build job: 'default-build/helm-deploy', parameters: defaultParams + [
+          [$class: 'StringParameterValue', name: 'CHART_NAME', value: replaceVariables(values.helm.chart, "value:helm.chart")],
+          [$class: 'StringParameterValue', name: 'CHART_REPO', value: repo],
+          [$class: 'StringParameterValue', name: 'CHART_VERSION', value: chartVersion],
+          [$class: 'StringParameterValue', name: 'CONFIGMAP_NAME', value: config],
+          [$class: 'StringParameterValue', name: 'HELM_ARGUMENTS', value: args],
+          [$class: 'StringParameterValue', name: 'HELM_RESOURCE', value: all_content],
+          [$class: 'StringParameterValue', name: 'HELM_VERSION', value: helmVersion],
+          [$class: 'StringParameterValue', name: 'NAMESPACE', value: replaceVariables(values.helm.namespace, "value:helm.namespace")],
+          [$class: 'StringParameterValue', name: 'REG_PASS', value: password],
+          [$class: 'StringParameterValue', name: 'REG_USER', value: username],
+          [$class: 'StringParameterValue', name: 'RELEASE_NAME', value: replaceVariables(values.helm.name, "value:helm.name")],
+        ]
+
+        echo "Done with step helm:${jobName}"
+      }
+    }
+
+    if(values.kubectl != null) {
+      jobs["Deploy ${jobName}"] = {
+        def yaml_content = ""
+
+        if(values.kubectl.file != null) {
+          def f = replaceVariables(values.kubectl.file, "value:kubectl.file")
+          yaml_content = replaceVariables(readFile(f), "value:kubectl.file, file:${f}")
+        }
+
+        if(values.kubectl.files != null) {
+          def file_contents = []
+          values.kubectl.files.eachWithIndex { f, index ->
+            f = replaceVariables(f, "value:kubectl.files[${index}]")
+            file_contents.push(replaceVariables(readFile(f), "value:kubectl.files[${index}], file:${f}"))
+          }
+          yaml_content = file_contents.join("\n---\n")
+        }
+
+        def namespace = ''
+        if(values.kubectl.namespace != null) {
+          namespace = replaceVariables(values.kubectl.namespace, "value:kubectl.namespace")
+        }
+
+        def config_name = 'kubectl-config'
+        if(values.kubectl.cluster != null) {
+            config_name = replaceVariables(values.kubectl.cluster, "value:kubectl.cluster")
+        }
+
+        def kubectl_action = "apply"
+        if(values.kubectl.action != null) {
+            kubectl_action = replaceVariables(values.kubectl.action, "value:kubectl.action")
+        }
+
+        def force = false
+        if(values.kubectl.force != null) {
+          force = replaceVariables(values.kubectl.force.toString(), "value:kubectl.force").toBoolean()
+        }
+
+        build job: 'default-build/kube-deploy', parameters: defaultParams + [
+          [$class: 'StringParameterValue', name: 'KUBE_RESOURCE', value: yaml_content],
+          [$class: 'BooleanParameterValue', name: 'KUBE_FORCE', value: force],
+          [$class: 'StringParameterValue', name: 'KUBE_NAMESPACE', value: namespace],
+          [$class: 'StringParameterValue', name: 'KUBE_ACTION', value: kubectl_action],
+          [$class: 'StringParameterValue', name: 'CONFIGMAP_NAME', value: config_name],
+        ]
+
+        echo "Done with step kubectl:${jobName}"
+      }
+    }
+
+    if(values["nuget-package"] != null) {
+      jobs["Package ${jobName}"] = {
+        final nuget_package = values["nuget-package"]
+
+        def project_path = replaceVariables(nuget_package["project-path"], "value:nuget-package.project-path")
+        def version = replaceVariables(nuget_package.version, "value:nuget-package.version")
+        def nuget_repo = replaceVariables(nuget_package.repo, "value:nuget-package.repo")
+
+        final skip_duplicate_prop = "skip-duplicate"
+        def skip_duplicate = false
+        if (nuget_package[skip_duplicate_prop]) {
+          skip_duplicate = replaceVariables(nuget_package[skip_duplicate_prop], "value:nuget-package.skip-duplicate").toBoolean()
+        }
+
+        build job: 'default-build/nuget-package', parameters: defaultParams + [
+          [$class: 'StringParameterValue', name: 'PROJECT_PATH', value: project_path],
+          [$class: 'StringParameterValue', name: 'NUGET_VERSION', value: version],
+          [$class: 'StringParameterValue', name: 'NUGET_REPO', value: nuget_repo],
+          [$class: 'BooleanParameterValue', name: 'NUGET_SKIP_DUPLICATE', value: skip_duplicate],
+        ]
+
+        echo "Done with step nuget-package:${jobName}"
+      }
+    }
+
+    if(values.container != null) {
+      jobs["Container ${jobName}"] = {
+        def commands = []
+        values.container.cmds.eachWithIndex { i, index ->
+          if(i instanceof String) {
+            commands.push(replaceVariables(i, "value:container.cmds[${index}]"))
+          } else if (i instanceof LinkedHashMap) {
+            commands.push(replaceVariables(i.entrySet().toArray()[0].toString(), "value:container.cmds[${index}]"))
+          }
+        }
+  
+        def replacedCommands = commands.join("\n")
+  
+        def serviceAccount = "default"
+        if(values.container.serviceAccount != null) {
+          serviceAccount = replaceVariables(values.container.serviceAccount, "value:container.serviceAccount")
+        }
+  
+        def shell = "/bin/sh"
+        if(values.container.shell != null) {
+          shell = replaceVariables(values.container.shell, "value:container.shell")
+        }
+  
+        def os = "linux"
+        if(values.container.os != null) {
+          os = replaceVariables(values.container.os, "value:container.os")
+        }
+  
+        def certMountPath = ""
+        if(values.container.certificatesMountPath != null) {
+          certMountPath = replaceVariables(values.container.certificatesMountPath, "value:container.certificatesMountPath")
+        }
+
+        def secretName = ""
+        if(values.container.secretName != null) {
+          secretName = replaceVariables(values.container.secretName, "value:container.secretName")
+        }
+
+        build job: 'default-build/container', parameters: defaultParams + [
+          [$class: 'StringParameterValue', name: 'CONTAINER_IMAGE', value: replaceVariables(values.container.image, "value:container.image")],
+          [$class: 'StringParameterValue', name: 'CONTAINER_CMDS', value: replacedCommands],
+          [$class: 'StringParameterValue', name: 'SERVICE_ACCOUNT', value: serviceAccount],
+          [$class: 'StringParameterValue', name: 'CONTAINER_SHELL', value: shell],
+          [$class: 'StringParameterValue', name: 'CONTAINER_OS', value: os],
+          [$class: 'StringParameterValue', name: 'CONTAINER_CERT_MOUNT_PATH', value: certMountPath],
+          [$class: 'StringParameterValue', name: 'CONTAINER_SECRET_NAME', value: secretName],
+        ]
+
+        echo "Done with step container:${jobName}"
+      }
+    }
+  }
+
+  parallel jobs
+}
+
+podTemplate(label: label, yaml: """
+apiVersion: v1
+kind: Pod
+metadata:
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+  - image: jenkins/jnlp-slave:3.29-1-alpine
+    imagePullPolicy: IfNotPresent
+    name: jnlp
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+""") {
+
+  logstash {
+    node(label) {
+      currentBuild.displayName = getDisplayName()
+
+      echo '##wharf##{"status":"Running"}'
+
+      setDomainVariable()
+
+      stage("Checkout code") {
+        if(params.REPO_NAME != '') {
+          env.ROOT_CERT = sh(
+            returnStdout: true,
+            script: "wget --no-check-certificate -q -O - '${JENKINS_CA_CERTS_URL}' || echo 'No cert available'"
+          );
+
+          env.GIT_CLONE_URL = params.GIT_FULLURL
+          if(params.GIT_FULLURL == '') {
+            env.GIT_CLONE_URL = "${params.GIT_USER}@${params.GIT_URL}:${params.REPO_GROUP}/${params.REPO_NAME}"
+          }
+
+          def repo = git(url: env.GIT_CLONE_URL, branch: "${params.REPO_BRANCH}", credentialsId: "${params.GIT_CREDENTIALS_ID}")
+          env.GIT_COMMIT = repo.GIT_COMMIT
+          env.REG_URL = params.REG_URL
+
+          def commit_subject = sh(
+            returnStdout: true,
+            script: "git log -n 1 ${repo.GIT_COMMIT} --format='%s'"
+          )
+          env.GIT_COMMIT_SUBJECT = "${commit_subject}"
+
+          def author_date = sh(
+            returnStdout: true,
+            script: "git log -n 1 ${repo.GIT_COMMIT} --format='%aI'"
+          )
+          env.GIT_COMMIT_AUTHOR_DATE = "${author_date}"
+
+          def committer_date = sh(
+            returnStdout: true,
+            script: "git log -n 1 ${repo.GIT_COMMIT} --format='%cI'"
+          )
+          env.GIT_COMMIT_COMMITTER_DATE = "${committer_date}"
+
+          def latest_tag = sh(
+            returnStdout: true,
+            script: "git tag --sort=-taggerdate --points-at | head -n 1 || echo ''"
+          ).replace('\n', '');
+
+          env.GIT_TAG = "${latest_tag}"
+
+          def revision = ''
+          if(latest_tag != '') {
+            revision = sh(
+              returnStdout: true,
+              script: "git rev-list ${latest_tag} --count || echo ''"
+            ).replace('\n', '');
+          }
+
+          env.GIT_REVISION = "${revision}"
+
+          echo "Found tag ${env.GIT_TAG}"
+        }
+      }
+
+      stage("Generate YAML") {
+        if(fileExists('.wharf-ci.yml') || params.REPO_NAME == '') {
+          echo "Skipping generation of .wharf-ci.yml file"
+        } else {
+          echo "Generating .wharf-ci.yml file"
+
+          def dockerfiles = findFiles(glob: '**/Dockerfile')
+          def file_name = '.wharf-ci.yml'
+          sh "echo 'build:' > ${file_name}"
+          for(i in dockerfiles) {
+            def name = params.REPO_NAME.toLowerCase();
+            if(i.path.startsWith("src/") && i.path != "src/Dockerfile") {
+              name = i.path.substring(4).reverse().substring(11).reverse().toLowerCase()
+            }
+            sh "echo \"  ${name}:\" >> ${file_name}"
+            sh "echo \"    docker:\" >> ${file_name}"
+            sh "echo \"      file: ${i.path}\" >> ${file_name}"
+            sh "echo -n \"      tag: \$\" >> ${file_name}"
+            sh "echo \"{GIT_COMMIT}\" >> ${file_name}"
+          }
+
+          def kubefiles = findFiles(glob: 'deploy/*.yml')
+          sh "echo \"\ndeploy:\" >> ${file_name}"
+          for(i in kubefiles) {
+            def name = i.path.substring(7).reverse().substring(4).reverse().toLowerCase()
+            sh "echo \"  ${name}:\" >> ${file_name}"
+            sh "echo \"    kubectl:\" >> ${file_name}"
+            sh "echo \"      file: ${i.path}\" >> ${file_name}"
+          }
+
+          echo "generated file:"
+          sh "cat ${file_name}"
+        }
+      }
+
+      try {
+        if(params.REPO_NAME != '') {
+          def buildDef = readYaml(file: ".wharf-ci.yml")
+          if(buildDef != null) {
+            if(params.VARS != '') {
+              def parsedInputVars = readYaml(text: params.VARS)
+              _replaceVariablesContextLabel = "inputs"
+              inputVars = replaceVariablesInMap(parsedInputVars)
+              _replaceVariablesContextLabel = "<unknown>"
+            } else {
+              inputVars = null
+            }
+
+            if (params.ENVIRONMENT != '' && buildDef.environments != null) {
+              def rawEnvVars = buildDef.environments[params.ENVIRONMENT]
+              _replaceVariablesContextLabel = "environment:${params.ENVIRONMENT}"
+              envVars = replaceVariablesInMap(rawEnvVars)
+              _replaceVariablesContextLabel = "<unknown>"
+            } else {
+              envVars = null
+            }
+
+            def defaultParams = [
+              [$class: 'StringParameterValue', name: 'BUILD_REF', value: params.BUILD_REF],
+              [$class: 'StringParameterValue', name: 'BUILD_NAME', value: getBuildName()],
+              [$class: 'StringParameterValue', name: 'GIT_CREDENTIALS_ID', value: params.GIT_CREDENTIALS_ID],
+              [$class: 'StringParameterValue', name: 'GIT_CLONE_URL', value: env.GIT_CLONE_URL],
+              [$class: 'StringParameterValue', name: 'GIT_CLONE_BRANCH', value: params.REPO_BRANCH],
+              [$class: 'StringParameterValue', name: 'WHARF_PROJECT_ID', value: params.WHARF_PROJECT_ID],
+              [$class: 'StringParameterValue', name: 'WHARF_INSTANCE', value: params.WHARF_INSTANCE],
+            ]
+
+            for(b in buildDef.entrySet().toArray()) {
+              def stage_name = b.getKey()
+
+              stage("${stage_name} ${REPO_NAME}/${REPO_GROUP}") {
+                if(params.REPO_NAME != '' && (params.RUN_STAGES.toLowerCase() == stage_name.toLowerCase() || params.RUN_STAGES.toLowerCase() == 'all')) {
+                  def stage = b.getValue()
+
+                  if(stage != null) {
+                    if(stage.environments == null || (params.ENVIRONMENT != '' && stage.environments.join(",").contains(params.ENVIRONMENT))) {
+                      runStage(stage, stage_name, defaultParams)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        echo '##wharf##{"status":"Completed"}'
+      } catch(err) {
+        echo '##wharf##{"status":"Failed"}'
+        throw err
+      }
+    }
+  }
+}

@@ -1,0 +1,102 @@
+properties([
+  parameters([
+    // Default parameters
+    string(name: 'BUILD_NAME', defaultValue: '', description: 'Used for the display name of the Jenkins build', ),
+    string(name: 'BUILD_REF', defaultValue: '', description: 'Build reference (for third party software)'),
+    string(name: 'GIT_CLONE_BRANCH', defaultValue: 'master', description: 'The branch to build', ),
+    string(name: 'GIT_CLONE_URL', defaultValue: '', description: 'Full URL of the git repo (ex: git@github.com/foo/bar.git)', ),
+    string(name: 'GIT_CREDENTIALS_ID', defaultValue: '', description: 'Git credentials id', ),
+    string(name: 'WHARF_PROJECT_ID', defaultValue: '', description: 'Number in Wharf DB that identifies a project'),
+    string(name: 'WHARF_INSTANCE', defaultValue: '', description: 'Identifies Wharf instance that started the build (e.g. stage)'),
+    // container specific parameters
+    string(name: 'CONTAINER_IMAGE', defaultValue: 'alpine:3.12.0', description: ''),
+    string(name: 'CONTAINER_CMDS', defaultValue: '', description: ''),
+    string(name: 'CONTAINER_SHELL', defaultValue: '/bin/sh', description: ''),
+    string(name: 'SERVICE_ACCOUNT', defaultValue: 'default', description: 'Service account to run pod as'),
+    choice(name: 'CONTAINER_OS', choices: ['linux', 'windows'], description: 'Which OS to place the pod on'),
+    string(name: 'CONTAINER_CERT_MOUNT_PATH', defaultValue: '', description: 'Public root CA-cert path'),
+    string(name: 'CONTAINER_SECRET_NAME', defaultValue: '', description: 'Name of a k8s secret'),
+  ]),
+])
+
+def label = "run-container-${UUID.randomUUID().toString()}"
+
+def baseImage = "jenkins/jnlp-slave:3.29-1-alpine"
+def shell = params.CONTAINER_SHELL
+if(params.CONTAINER_OS == "windows") {
+    baseImage = "harbor.local/tools/jnlp-windows:latest"
+
+    if(params.CONTAINER_SHELL == "/bin/sh") {
+        shell = "powershell.exe"
+    }
+}
+
+def certVolumes = ""
+if(params.CONTAINER_CERT_MOUNT_PATH != '') {
+  certVolumes =  """
+    volumeMounts:
+    - name: config-volume
+      mountPath: ${params.CONTAINER_CERT_MOUNT_PATH}
+  volumes:
+    - name: config-volume
+      configMap:
+        name: ca-certificates-config 
+"""
+}
+
+def envFrom = ""
+if(params.WHARF_INSTANCE != '' && params.WHARF_PROJECT_ID != '' && params.CONTAINER_SECRET_NAME != '') {
+  envFrom = """
+    envFrom:
+      - secretRef:
+          name: wharf-${params.WHARF_INSTANCE}-project-${params.WHARF_PROJECT_ID}-secretname-${params.CONTAINER_SECRET_NAME}
+          optional: true 
+"""  
+}
+
+podTemplate(name: 'run-container', label: label, yaml: """
+kind: Pod
+metadata:
+  name: run-container
+spec:
+  serviceAccountName: ${params.SERVICE_ACCOUNT}
+  nodeSelector:
+    kubernetes.io/os: ${params.CONTAINER_OS}
+  containers:
+  - name: jnlp
+    image: ${baseImage}
+    imagePullPolicy: IfNotPresent
+  - name: run-container
+    image: ${params.CONTAINER_IMAGE}
+    imagePullPolicy: IfNotPresent
+    command:
+    - ${shell}
+    tty: true
+${envFrom}
+${certVolumes} 
+  imagePullSecrets:
+  - name: gitlab-registry
+"""
+  ) {
+  logstash {
+    node(label) {
+      currentBuild.displayName = "${params.BUILD_NAME} ${params.CONTAINER_IMAGE}"
+
+      stage("Run commands") {
+        git(url: "${params.GIT_CLONE_URL}", branch: "${params.GIT_CLONE_BRANCH}", credentialsId: "${params.GIT_CREDENTIALS_ID}")
+
+        if (params.CONTAINER_CMDS != '') {
+          container(name: 'run-container', shell: "${params.CONTAINER_SHELL}") {
+            if (params.CONTAINER_OS == 'linux') {
+              sh """#!${params.CONTAINER_SHELL}
+${params.CONTAINER_CMDS}
+              """
+            } else if (params.CONTAINER_OS == 'windows') {
+              sh "powershell.exe -C '${params.CONTAINER_CMDS}'"
+            }
+          }
+        }
+      }
+    }
+  }
+}

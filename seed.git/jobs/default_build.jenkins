@@ -1,0 +1,45 @@
+#!/usr/bin/env groovy
+
+multibranchPipelineJob('default-build') {
+    branchSources {
+        branchSource {
+            source {
+                git {
+                    remote("${JENKINS_BUILD_GIT_URL}")
+                    credentialsId("${JENKINS_GIT_CREDENTIALS_ID}")
+                    traits {
+                        cloneOptionTrait {
+                            extension {
+                                noTags(false)
+                                honorRefspec(false)
+                                shallow(true)
+                                depth(0)
+                                reference("")
+                                timeout(10)
+                            }
+                        }
+                        gitBranchDiscovery()
+                        gitTagDiscovery()
+                    }
+                }
+            }
+            strategy {
+                defaultBranchPropertyStrategy {
+                    props {
+                        // Suppresses the normal SCM commit trigger coming from branch indexing
+                        noTriggerBranchProperty()
+                    }
+                }
+            }
+        }
+    }
+    factory {
+        workflowBranchProjectFactory {
+            scriptPath("Jenkinsfile")
+        }
+    }
+
+    orphanedItemStrategy {
+        discardOldItems {}
+    }
+}

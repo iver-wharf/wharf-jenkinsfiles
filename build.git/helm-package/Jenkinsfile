@@ -1,0 +1,63 @@
+properties([
+  parameters([
+    // Default parameters
+    string(name: 'BUILD_NAME', defaultValue: '', description: 'Used for the display name of the Jenkins build', ),
+    string(name: 'BUILD_REF', defaultValue: '', description: 'Build reference (for third party software)'),
+    string(name: 'GIT_CLONE_BRANCH', defaultValue: 'master', description: 'The branch to build', ),
+    string(name: 'GIT_CLONE_URL', defaultValue: '', description: 'Full URL of the git repo (ex: git@github.com/foo/bar.git)', ),
+    string(name: 'GIT_CREDENTIALS_ID', defaultValue: '', description: 'Git credentials id', ),
+    string(name: 'WHARF_PROJECT_ID', defaultValue: '', description: 'Number in Wharf DB that identifies a project'),
+    string(name: 'WHARF_INSTANCE', defaultValue: '', description: 'Identifies Wharf instance that started the build (e.g. stage)'),
+    // helm-package specific parameters
+    string(name: 'CHART_PATH', defaultValue: '', description: ''),
+    string(name: 'CHART_VERSION', defaultValue: '', description: ''),
+    string(name: 'CHART_REPO', defaultValue: '', description: ''),
+    string(name: 'REG_USER', defaultValue: '', description: 'Username for login to CHART_REPO'),
+    password(name: 'REG_PASS', defaultValue: '', description: 'Password for login to CHART_REPO'),
+  ]),
+])
+
+def label = "helm-package-${UUID.randomUUID().toString()}"
+
+podTemplate(name: 'helm-package', label: label, yaml: """
+kind: Pod
+metadata:
+  name: helm-package
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+  - name: helm-package
+    image: wharfse/helm:v3.0.2
+    imagePullPolicy: IfNotPresent
+    command:
+    - /bin/sh
+    tty: true
+"""
+  ) {
+  node(label) {
+    currentBuild.displayName = "${params.BUILD_NAME} ${params.CHART_PATH}"
+
+    stage("Package helm-chart") {
+      git(url: "${params.GIT_CLONE_URL}", branch: "${params.GIT_CLONE_BRANCH}", credentialsId: "${params.GIT_CREDENTIALS_ID}")
+
+      def version = ""
+      if(params.CHART_VERSION != "") {
+        version = "--version=${params.CHART_VERSION}"
+      }
+
+      container(name: 'helm-package', shell: '/bin/sh') {
+        sh """#!/bin/sh
+
+        echo helm package ${params.CHART_PATH} ${version}
+
+        helm package ${params.CHART_PATH} ${version}
+
+        echo helm push *.tgz ${params.CHART_REPO} --insecure --username xxx --password xxx
+        helm push *.tgz ${params.CHART_REPO} --insecure --username ${params.REG_USER} --password ${params.REG_PASS}
+
+        """
+      }
+    }
+  }
+}

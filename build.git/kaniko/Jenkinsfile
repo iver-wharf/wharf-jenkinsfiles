@@ -1,0 +1,137 @@
+properties([
+  parameters([
+    // Default parameters
+    string(name: 'BUILD_NAME', defaultValue: '', description: 'Used for the display name of the Jenkins build', ),
+    string(name: 'BUILD_REF', defaultValue: '', description: 'Build reference (for third party software)'),
+    string(name: 'GIT_CLONE_BRANCH', defaultValue: 'master', description: 'The branch to build', ),
+    string(name: 'GIT_CLONE_URL', defaultValue: '', description: 'Full URL of the git repo (ex: git@github.com/foo/bar.git)', ),
+    string(name: 'GIT_CREDENTIALS_ID', defaultValue: '', description: 'Git credentials id', ),
+    string(name: 'WHARF_PROJECT_ID', defaultValue: '', description: 'Number in Wharf DB that identifies a project'),
+    string(name: 'WHARF_INSTANCE', defaultValue: '', description: 'Identifies Wharf instance that started the build (e.g. stage)'),
+    // kaniko specific parameters
+    text(name: 'DOCKERFILE_ARGS', defaultValue: '', description: 'Dockerfile ARG values, one per line in "key=value" fashion'),
+    booleanParam(name: 'DOCKERFILE_APPEND_CERT', defaultValue: true, description: 'Append adding the certificate to the Dockerfile.'),
+    string(name: 'DOCKERFILE_CONTEXT', defaultValue: '/', description: 'Build context relative to the repo root'),
+    string(name: 'DOCKERFILE_PATH', defaultValue: '', description: 'Relative path to current Dockerfile'),
+    string(name: 'IMAGE_DESTINATION', defaultValue: '', description: 'Full name of the image, including the registry name (ex: harbor.local/default/test)'),
+    string(name: 'IMAGE_TAGS', defaultValue: '', description: 'Tags of the image. Comma separated.'),
+    booleanParam(name: 'IMAGE_PUSH', defaultValue: true, description: 'Push to container registry'),
+    booleanParam(name: 'INSECURE', defaultValue: false, description: 'Insecure registry'),
+    string(name: 'REG_SECRET', defaultValue: 'gitlab-registry', description: 'Kubernetes secret containing registry login', ),
+    text(name: 'ROOT_CERT', defaultValue: '', description: 'Public root CA-cert'),
+  ])
+])
+
+def label = "kaniko-${UUID.randomUUID().toString()}"
+
+podTemplate(name: 'kaniko', label: label, yaml: """
+kind: Pod
+metadata:
+  name: kaniko
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+  - name: kaniko
+    image: boolman/kaniko:busybox-2020-01-15
+    imagePullPolicy: IfNotPresent
+    command:
+    - /busybox/cat
+    tty: true
+    resources:
+      limits:
+        cpu: 4000m
+        memory: 12Gi
+      requests:
+        cpu: 128m
+        memory: 512Mi
+    volumeMounts:
+      - name: jenkins-docker-cfg
+        mountPath: /root/.docker
+  volumes:
+  - name: jenkins-docker-cfg
+    projected:
+      sources:
+      - secret:
+          name: ${params.REG_SECRET}
+          items:
+            - key: .dockerconfigjson
+              path: config.json
+"""
+  ) {
+
+  logstash {
+    node(label) {
+      currentBuild.displayName = "${params.BUILD_NAME} ${params.DOCKERFILE_PATH}"
+
+      stage('Build with Kaniko') {
+        echo "Building '${params.GIT_CLONE_URL}' branch '${params.GIT_CLONE_BRANCH}'"
+        git(url: "${params.GIT_CLONE_URL}", branch: "${params.GIT_CLONE_BRANCH}", credentialsId: "${params.GIT_CREDENTIALS_ID}")
+
+        def kaniko_args = []
+
+        def destination = params.IMAGE_DESTINATION
+        def destinations = []
+        def tags = params.IMAGE_TAGS.split(',')
+        for(j in tags) {
+          if(j != "") {
+            destinations.push("--destination=${destination}:${j}")
+          }
+        }
+
+        def str_dest = destinations.join(' ').replace("\n", "")
+        echo "Destinations: ${str_dest}"
+
+        def args = params.DOCKERFILE_ARGS.split('\n')
+        for(j in args) {
+          if(j != "") {
+            def esc = j.replaceAll(/'/, "'\\\\''")
+            kaniko_args.push("--build-arg '${esc}'")
+            echo "Docker arg: --build-arg '${esc}'"
+          }
+        }
+
+        if(params.INSECURE) {
+          echo "Using insecure registry (--insecure)"
+          kaniko_args.push("--insecure")
+        }
+
+        if (!params.IMAGE_PUSH) {
+          echo "Disabled image pushing for built docker image (--no-push)"
+          kaniko_args.push("--no-push")
+        }
+
+        def str_kaniko_args = kaniko_args.join(' ')
+
+        container(name: 'kaniko', shell: '/busybox/sh') {
+          withEnv(['PATH+EXTRA=/busybox/']) {
+            sh """#!/busybox/sh
+
+if [ "${params.DOCKERFILE_APPEND_CERT}" == "true" ]
+then
+
+cert_path=`pwd`/${params.DOCKERFILE_CONTEXT}/root.crt
+
+cat <<EOF > root.crt
+${params.ROOT_CERT}
+EOF
+
+cp root.crt \$cert_path
+
+echo -e "\n" >> `pwd`/${params.DOCKERFILE_PATH}
+echo COPY ./root.crt /usr/local/share/ca-certificates/root.crt >> `pwd`/${params.DOCKERFILE_PATH}
+echo "RUN mkdir -p /etc/ssl/certs/ && touch /etc/ssl/certs/ca-certificates.crt && cat /usr/local/share/ca-certificates/root.crt >> /etc/ssl/certs/ca-certificates.crt"  >> `pwd`/${params.DOCKERFILE_PATH}
+
+fi
+
+cat `pwd`/${params.DOCKERFILE_PATH}
+
+set -x
+/kaniko/executor -f `pwd`/${params.DOCKERFILE_PATH} -c `pwd` --context=dir://`pwd`/${params.DOCKERFILE_CONTEXT} --skip-tls-verify ${str_dest} --verbosity warn ${str_kaniko_args}
+"""
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,108 @@
+properties([
+  parameters([
+    // Default parameters
+    string(name: 'BUILD_NAME', defaultValue: '', description: 'Used for the display name of the Jenkins build', ),
+    string(name: 'BUILD_REF', defaultValue: '', description: 'Build reference (for third party software)'),
+    string(name: 'GIT_CLONE_BRANCH', defaultValue: 'master', description: 'The branch to build', ),
+    string(name: 'GIT_CLONE_URL', defaultValue: '', description: 'Full URL of the git repo (ex: git@github.com/foo/bar.git)', ),
+    string(name: 'GIT_CREDENTIALS_ID', defaultValue: '', description: 'Git credentials id', ),
+    string(name: 'WHARF_PROJECT_ID', defaultValue: '', description: 'Number in Wharf DB that identifies a project'),
+    string(name: 'WHARF_INSTANCE', defaultValue: '', description: 'Identifies Wharf instance that started the build (e.g. stage)'),
+    // container specific parameters
+    string(name: 'PROJECT_PATH', defaultValue: '', description: ''),
+    string(name: 'NUGET_VERSION', defaultValue: '', description: ''),
+    string(name: 'NUGET_REPO', defaultValue: 'nuget.local', description: ''),
+    booleanParam(name: 'NUGET_SKIP_DUPLICATE', defaultValue: false, description: 'Treats any "500 Internal Server Error" with "packages that already exist" in the response body, or simply a "409 Conflict" response as a warning so that the push can continue.'),
+  ]),
+])
+
+def label = "nuget-package-${UUID.randomUUID().toString()}"
+
+podTemplate(name: 'nuget-package', label: label, yaml: """
+kind: Pod
+metadata:
+  name: nuget-package
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+  - name: nuget-package
+    image: harbor.local/dotnet/core/sdk:3.1-alpine
+    imagePullPolicy: IfNotPresent
+    command:
+    - /bin/sh
+    tty: true
+"""
+  ) {
+  node(label) {
+    withCredentials([string(credentialsId: '${JENKINS_NUGET_CREDENTIALS_ID}', variable: 'NUGET_TOKEN')]) {
+      currentBuild.displayName = "${params.BUILD_NAME} ${params.NUGET_VERSION}"
+
+      stage("Package and publish nuget") {
+        git(url: "${params.GIT_CLONE_URL}", branch: "${params.GIT_CLONE_BRANCH}", credentialsId: "${params.GIT_CREDENTIALS_ID}")
+
+        def versionParam = ""
+        if (params.NUGET_VERSION != "") {
+          versionParam = "/property:Version=\"${params.NUGET_VERSION}\""
+        }
+
+        def skipDuplicatesParam = ""
+        if (params.NUGET_SKIP_DUPLICATE) {
+          skipDuplicatesParam = "--skip-duplicate"
+        }
+
+        container(name: 'nuget-package', shell: '/bin/sh') {
+          sh """#!/bin/sh
+          echo '\$ dotnet pack "${PROJECT_PATH}" --output nugets/ ${versionParam}'
+          if ! dotnet pack "${PROJECT_PATH}" --output nugets/ ${versionParam}
+          then
+            echo "[!] Failed to build and pack the NuGet packages. Aborting" >&2
+            exit 1
+          fi
+
+          # mkfifo solution found here: https://stackoverflow.com/a/61470435/3163818
+          mkfifo nuget_push_output
+
+          # Must push all NuGets one by one because the 500 status code issue
+          # will make the pushing abort half-way.
+          for nuget in nugets/*
+          do
+            echo
+            echo "\$ dotnet nuget push \\"\$nuget\\" --api-key *REDACTED* --source \\"${NUGET_REPO}\\" ${skipDuplicatesParam}"
+
+            # Store logs in nuget-push.log and output to the terminal
+            tee nuget-push.log < nuget_push_output &
+            TEE_PROCESS_ID=\$!
+
+            dotnet nuget push "\$nuget" --api-key "${NUGET_TOKEN}" --source "${NUGET_REPO}" ${skipDuplicatesParam} > nuget_push_output 2>&1
+            EXIT_STATUS=\$?
+
+            kill \$TEE_PROCESS_ID
+
+            # Our NuGet server incorrectly returns HTTP status code 500 instead
+            # of 409 on duplicates.
+            # The --skip-duplicate flag only handles 409 status codes.
+            # So we need this extra check via grep on the programs ouput.
+            if grep -q 'The server is configured to not allow overwriting packages that already exist.' nuget-push.log
+            then
+              if [ "${NUGET_SKIP_DUPLICATE}" != "true" ]
+              then
+                echo
+                echo "[!] Detected duplicate, but NUGET_SKIP_DUPLICATE is not set to true. Aborting"
+                exit 2
+              else
+                echo
+                echo "[x] Detected duplicate, and NUGET_SKIP_DUPLICATE is set to true. Silently continuing."
+              fi
+            elif [ \$EXIT_STATUS != 0 ]
+            then
+              echo "[!] Failed to push NuGet packages. Aborting" >&2
+              exit 3
+            fi
+          done
+          """
+        }
+      }
+    }
+  }
+}

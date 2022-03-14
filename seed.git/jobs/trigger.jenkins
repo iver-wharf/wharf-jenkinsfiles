@@ -1,0 +1,91 @@
+#!/usr/bin/env groovy
+
+job('trigger') {
+    displayName('trigger')
+
+    parameters {
+        // https://jenkinsci.github.io/job-dsl-plugin/#path/pipelineJob-parameters
+        stringParam("REPO_NAME", null, "Repository name.")
+        stringParam("REPO_GROUP", "default", "Repository group.")
+        stringParam("REPO_BRANCH", "master", "Repository Git branch.")
+        stringParam("RUN_STAGES", "ALL", null)
+        stringParam("BUILD_REF", null, "Wharf build ID")
+        stringParam("ENVIRONMENT", null, "Wharf environment")
+        textParam("VARS", null, null)
+        stringParam("GIT_FULLURL", null, null)
+        stringParam("GIT_CREDENTIALS_ID", "${JENKINS_GIT_CREDENTIALS_ID}", "ID of the credentials stored in Jenkins to use when pulling the designated repository.")
+        stringParam("WHARF_PROJECT_ID", null, "Wharf project ID, integer")
+        stringParam("WHARF_INSTANCE", null, "Wharf instance ID, ex: 'prod' or 'dev'")
+    }
+
+    concurrentBuild(true)
+
+    triggers {
+        genericTrigger {
+            genericRequestVariables {
+                genericRequestVariable {
+                    key("REPO_NAME")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("REPO_GROUP")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("REPO_BRANCH")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("ENVIRONMENT")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("RUN_STAGES")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("VARS")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("BUILD_REF")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("GIT_FULLURL")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("GIT_CREDENTIALS_ID")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("WHARF_PROJECT_ID")
+                    regexpFilter("")
+                }
+                genericRequestVariable {
+                    key("WHARF_INSTANCE")
+                    regexpFilter("")
+                }
+            }
+            token("${JENKINS_WEBHOOK_TOKEN}")
+            causeString("Webhook trigger")
+            printContributedVariables(false)
+            printPostContent(false)
+            silentResponse(false)
+            regexpFilterText("")
+            regexpFilterExpression("")
+        }
+    }
+
+    steps {
+        downstreamParameterized {
+            trigger('default-build/trigger') {
+                parameters {
+                    currentBuild()
+                }
+            }
+        }
+    }
+}
+
